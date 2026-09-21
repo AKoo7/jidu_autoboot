@@ -1,0 +1,72 @@
+From 28ae81ca9ea7ea189d8b17eb1afa5816457faf9f Mon Sep 17 00:00:00 2001
+From: AK Sharma <maskachoska@yahoo.com>
+Date: Mon, 21 Sep 2026 13:53:30 +0530
+Subject: [PATCH 2/4] mediatek: filogic: fix MAC retrieval on JioRouter AX6000
+ JIDU6801
+
+The Telpa-built JIDU6801 reuses the jidu6101 DTS, so it lands in that board.d
+case - but its u-boot-env MTD partition is a decoy and carries no 'mac' field
+(the live env, a UBI volume, has none either). That left label_mac empty and
+handed the empty string to macaddr_add(), which does
+
+	$((0x${nic//:/} + val & 0xffffff))
+
+i.e. $((0x + 1 & 0xffffff)). busybox ash rejects 0x as an arithmetic syntax
+error, the subshell dies, and macaddr_add returns the literal ":" - which is
+non-empty, so the [ -n "$lan_mac" ] guard downstream passes it through and
+/etc/board.json ends up with "macaddr": ":". The box then ran on a random MAC
+(fa:2e:85:96:db:78), changing every boot.
+
+The factory MAC is the first 6 bytes of MFG: [redact-mac-0x27], which is the
+WAN address and the LAN address - 1. That matches what stock programmed:
+/etc/config/network on the unit has macaddr [redact-mac-0x27] on eth1 and
+[redact-mac-0x28] on the lan interface, and its lan IPv6 link-local was
+[redact-lladdr].
+
+Read it only when the board is identified as a JIDU6801 by the model string in
+MFG, because the MFG layout is not uniform across JioRouter AX6000 boards (the
+6j01 branch reads 0x20 for JIDU6401 and an ASCII key at 0x1d0 for JIDU6601).
+Nothing changes for a board whose u-boot-env does carry a mac, and if no MAC is
+found at all the variables are simply left unset so the guards omit them rather
+than writing garbage.
+
+Verified: yields wan=[redact-mac-0x27] lan=[redact-mac-0x28] against the real
+MFG dump, and the built rootfs contains the change.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ .../filogic/base-files/etc/board.d/02_network   | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/target/linux/mediatek/filogic/base-files/etc/board.d/02_network b/target/linux/mediatek/filogic/base-files/etc/board.d/02_network
+index a289e10..4802a94 100644
+--- a/target/linux/mediatek/filogic/base-files/etc/board.d/02_network
++++ b/target/linux/mediatek/filogic/base-files/etc/board.d/02_network
+@@ -314,8 +314,23 @@ mediatek_setup_macs()
+ 		;;
+ 	jiorouter,ax6000-jidu6101)
+ 		label_mac=$(mtd_get_mac_ascii u-boot-env mac)
++		# The Telpa-built JIDU6801 shares this board's DTS but has no 'mac' in
++		# u-boot-env: that partition is a decoy there and the live env (a UBI
++		# volume) carries none either, which left label_mac empty and made
++		# macaddr_add below emit ':' plus "arithmetic syntax error". Its MAC is
++		# the first 6 bytes of MFG - the WAN address stock used, LAN being +1.
++		if [ -z "$label_mac" ]; then
++			local mfg_dev model
++			mfg_dev=$(find_mtd_chardev "MFG")
++			if [ -n "$mfg_dev" ]; then
++				model=$(dd if="$mfg_dev" bs=1024 count=1 2>/dev/null | strings |
++					grep -o -m1 'JIDU[0-9A-Z]*')
++				[ "$model" = "JIDU6801" ] &&
++					label_mac=$(get_mac_binary "$mfg_dev" 0x0)
++			fi
++		fi
+ 		wan_mac=$label_mac
+-		lan_mac=$(macaddr_add "$label_mac" 1)
++		[ -n "$label_mac" ] && lan_mac=$(macaddr_add "$label_mac" 1)
+ 		;;
+ 	jiorouter,ax6000-jidu6j01)
+ 		local mfg_dev
+-- 
+2.53.0
+

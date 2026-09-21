@@ -1,0 +1,6 @@
+#!/bin/sh /etc/rc.common
+# /etc/init.d/handoff - starts the JIDU6801 kernel handoff late in boot, after the
+# network is up (that is also what gives you an SSH window to cancel it).
+START=99
+boot() { /overlay/jidu6801/handoff.sh & }
+start() { /overlay/jidu6801/handoff.sh & }

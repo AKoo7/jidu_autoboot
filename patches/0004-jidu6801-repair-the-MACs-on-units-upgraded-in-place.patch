@@ -1,0 +1,139 @@
+From ec8a477b8d92c8b06aa8c9a8e83243ad8608bfef Mon Sep 17 00:00:00 2001
+From: AK Sharma <maskachoska@yahoo.com>
+Date: Mon, 21 Sep 2026 17:31:08 +0530
+Subject: [PATCH 4/4] jidu6801: repair the ":" MACs on units upgraded in place
+
+The MAC fix (28ae81c) only takes effect when board detection runs, and both
+board_detect and config_generate only run when /etc/board.json is absent.  A
+rootfs-only upgrade keeps /overlay by design - that is the feature that makes
+config survive - so an already-installed unit never re-derives its MACs and keeps
+the broken ones, with every port on a random address that changes each boot.
+
+This is a one-shot uci-defaults migration.  A fresh install is unaffected: its
+board.json is generated correctly the first time, so the script finds nothing to
+do and exits silently without touching anything.
+
+It does not re-derive the MAC values.  It calls board_detect so the fixed
+02_network produces them, then propagates that into /etc/config/network - one
+source of truth for how MFG is read and which board layout applies, so the
+migration follows automatically if that logic ever changes.
+
+It repairs the two things the pre-fix image actually got wrong: the ":" macaddr
+on each LAN port, and the *absence* of a 'wan' device section entirely (the old
+wan_mac was empty, so the guard skipped it) - which left the WAN on the conduit's
+random address.
+
+Verified end to end on the bench unit: planted the exact pre-fix pollution (4
+bad macaddrs, no wan device section, board.json lan ":") into the overlay, then
+did a genuine rootfs-only upgrade.  On the next boot the migration ran
+(uci-defaults marker consumed), fixed all four LAN ports, created the wan device
+section, and regenerated board.json with the correct lan/wan/label_macaddr.
+Also verified: idempotent (a second run changes nothing), silent on a healthy
+unit, and it bails without modifying anything when board_detect yields no MACs
+(tested with a stub, not by shadowing PATH - board_detect sources its own
+functions, so a PATH shadow does not reach it).
+
+Two traps around files/ worth knowing, both hit while doing this:
+ - upstream's .gitignore line 16 is `/files`, so a new file under it is skipped
+   by a plain `git add -A` - it has to be force-added, like the three existing
+   entries.  Silently uncommitted is very close to silently absent.
+ - a change under files/ does not invalidate the image target, so `make`
+   regenerates root.squashfs byte-identical and the change never ships.  Touch
+   target/linux/mediatek/image/{Makefile,filogic.mk} to force it, and verify the
+   marker inside the built root rather than trusting the tree.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ .../etc/uci-defaults/99-jidu6801-fix-macaddr  | 80 +++++++++++++++++++
+ 1 file changed, 80 insertions(+)
+ create mode 100755 files/etc/uci-defaults/99-jidu6801-fix-macaddr
+
+diff --git a/files/etc/uci-defaults/99-jidu6801-fix-macaddr b/files/etc/uci-defaults/99-jidu6801-fix-macaddr
+new file mode 100755
+index 0000000..0e9db74
+--- /dev/null
++++ b/files/etc/uci-defaults/99-jidu6801-fix-macaddr
+@@ -0,0 +1,80 @@
++#!/bin/sh
++# Repair the ":" MACs a pre-fix image left behind — for units UPGRADED in place.
++#
++# The MAC fix in board.d/02_network only takes effect when board detection runs,
++# and both board_detect and config_generate only run when /etc/board.json is
++# ABSENT.  A rootfs-only upgrade keeps /overlay by design (that is a feature -
++# your config survives), so an already-installed unit never re-derives its MACs
++# and keeps the broken ones.  netifd cannot use ":" as a MAC, so every port fell
++# back to a random one, new on each boot, which breaks DHCP reservations and
++# anything keyed on the address.
++#
++# The broken values came from the old 02_network feeding an empty label_mac to
++# macaddr_add(): the arithmetic error made it emit the literal ":", which is
++# non-empty, so the [ -n "$lan_mac" ] guard downstream passed it through.
++#
++# This runs once per rootfs install (uci-defaults, so a fresh install is
++# unaffected: its board.json is generated correctly the first time).
++#
++# The MAC values are NOT re-derived here.  board_detect is invoked so the fixed
++# 02_network produces them, which keeps a single source of truth for how MFG is
++# read and which board layout applies — if that logic ever changes, this follows.
++
++NET=/etc/config/network
++CFG=/etc/board.json
++NEW=/tmp/board.json.migrate
++
++[ -f "$NET" ] || exit 0
++
++# --- does anything actually need repairing? ---------------------------------
++# Stay completely silent and touch nothing on a healthy unit: this script ships
++# in every image and runs on every rootfs install, including ones that never saw
++# the bug.
++badsecs=""
++for s in $(uci -q show network 2>/dev/null | grep -F '.macaddr=' | cut -d. -f2); do
++	v=$(uci -q get "network.$s.macaddr" 2>/dev/null)
++	case "$v" in
++	':'|'00:00:00:00:00:00'|'') badsecs="$badsecs $s" ;;
++	esac
++done
++
++# The pre-fix image never created a 'wan' device section at all (its wan_mac was
++# empty, so the guard skipped it), which leaves the WAN on the conduit's random
++# address.  Detect that too.
++wansec=$(uci -q show network 2>/dev/null | grep -F ".name='wan'" | cut -d. -f2 | head -1)
++
++[ -n "$badsecs" ] || [ -n "$wansec" ] || exit 0
++
++# --- get the correct values from the FIXED board detection ------------------
++/bin/board_detect "$NEW" 2>/dev/null || exit 0
++WAN=$(jsonfilter -i "$NEW" -e '@.network.wan.macaddr' 2>/dev/null)
++LAN=$(jsonfilter -i "$NEW" -e '@.network.lan.macaddr' 2>/dev/null)
++if [ -z "$WAN" ] || [ -z "$LAN" ]; then
++	# Not a board this applies to (or MFG unreadable) - change nothing.
++	rm -f "$NEW"
++	exit 0
++fi
++
++# --- repair -----------------------------------------------------------------
++for s in $badsecs; do
++	nm=$(uci -q get "network.$s.name" 2>/dev/null)
++	case "$nm" in
++	wan) uci -q set "network.$s.macaddr=$WAN" ;;
++	*)   uci -q set "network.$s.macaddr=$LAN" ;;
++	esac
++done
++
++if [ -z "$wansec" ]; then
++	# create the missing wan device section, matching what a fresh install has
++	uci -q add network device >/dev/null
++	uci -q set "network.@device[-1].name=wan"
++	uci -q set "network.@device[-1].macaddr=$WAN"
++fi
++
++uci -q commit network
++
++# board.json regenerated by the fixed 02_network; it also carries label_macaddr
++# now, which the broken one had as ":".
++mv "$NEW" "$CFG"
++
++exit 0
+-- 
+2.53.0
+

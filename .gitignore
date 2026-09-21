@@ -1,0 +1,32 @@
+# jidu_autoboot — build outputs and anything unit-specific.
+
+# Credentials, if you keep any locally. Tools that need them should read a file
+# like this rather than carrying values inline; nothing in this repo does.
+/creds/
+
+# --- build outputs ------------------------------------------------------------------
+# The payload pieces mkpayload.py and build.sh produce, and the squashfs roots.
+/autostart/out*/
+/out*/
+/Image
+/payload.bin
+*.squashfs
+*.dtb
+part*.bin
+
+# Compiled module bits.  *_main.c is generated: the Makefile copies X.c to
+# X_main.c before building, so X.c is the source and X_main.c is a build-time
+# duplicate.  Committing it would put two versions of one source in the tree.
+*.o
+*.ko
+*_main.c
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+Module.symvers
+modules.order
+
+# Python bytecode
+__pycache__/
+*.pyc

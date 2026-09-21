@@ -1,0 +1,67 @@
+From 4a76a484d8829d6b9b1bc1b6cc193796ffbc50a1 Mon Sep 17 00:00:00 2001
+From: AK Sharma <maskachoska@yahoo.com>
+Date: Mon, 21 Sep 2026 14:18:00 +0530
+Subject: [PATCH 3/4] jidu6801: make the handoff boot token survive an abrupt
+ power cut
+
+The handoff-ack init script wrote <boot_id> <count> to /overlay/handoff-ack
+without ever syncing. The write therefore sat in the page cache for up to
+~30s (dirty_expire_interval), so a power cut inside that window lost it.
+
+That is not cosmetic. The stock-side hook proves "our kernel booted" by
+comparing this token against the copy it stored, and it only clears its
+failure streak when the token *changed*. If the token is lost the comparison
+finds no change, so a genuinely SUCCESSFUL handoff is counted toward the
+5-strike disarm - and after five power cuts the hook disarms and strands the
+box on stock, which is exactly the state the guard exists to avoid.
+
+Observed live on 2026-09-21: a relay-driven cold cycle reset the counter to 1
+(the file had been recreated from scratch, so the read yielded nothing) and
+the next stock boot logged "attempt 2, failure streak 2 of 5" after a clean,
+successful handoff.
+
+Also guard the write: /overlay must be the real UBIFS mount and not the
+read-only squashfs mountpoint, because a write that lands on the rootfs image
+fails silently and has exactly the same effect - a token that never changes.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ files/etc/init.d/handoff-ack | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/files/etc/init.d/handoff-ack b/files/etc/init.d/handoff-ack
+index 98137d7..787b16b 100755
+--- a/files/etc/init.d/handoff-ack
++++ b/files/etc/init.d/handoff-ack
+@@ -15,12 +15,27 @@ START=99
+ 
+ start() {
+ 	local ack=/overlay/handoff-ack
+-	[ -d /overlay ] || return 0
++	# /overlay has to be the real UBIFS mount, not the read-only squashfs
++	# mountpoint: a write that lands on the rootfs image fails *silently*, the
++	# token then never changes, and the stock-side hook reads that as "the
++	# handoff never worked" and marches its failure streak toward a disarm.
++	grep -q " /overlay " /proc/mounts || {
++		logger -t handoff-ack "/overlay is not a mount - token NOT written"
++		return 1
++	}
+ 	local n
+ 	n=$(cat "$ack" 2>/dev/null | awk '{print $2}')
+ 	# The boot id makes the token different on every boot even if this volume is
+ 	# ever wiped and the counter restarts - the hook compares tokens for
+ 	# inequality, not for growth.
+ 	echo "$(cat /proc/sys/kernel/random/boot_id) $((n + 1))" > "$ack"
++	# Make the token durable before the box can lose power.  Without this the
++	# write sits in the page cache for up to ~30s (dirty_expire_interval), so an
++	# abrupt power cut - a relay cycle, a yanked plug - loses it; the token then
++	# reads as unchanged (or the file as absent) and the hook counts a
++	# *successful* boot toward its 5-strike disarm, eventually stranding the box
++	# on stock.  Observed live: a relay cold-cycle reset the counter to 1 and
++	# made the hook log "attempt 2, failure streak 2 of 5" after a clean boot.
++	sync
+ 	logger -t handoff-ack "boot ack $((n + 1))"
+ }
+-- 
+2.53.0
+

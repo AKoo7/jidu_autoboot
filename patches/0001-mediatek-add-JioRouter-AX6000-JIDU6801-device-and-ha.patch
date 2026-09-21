@@ -1,0 +1,106 @@
+From 4f76d7f580613e2bd537d157452aa476e24e1316 Mon Sep 17 00:00:00 2001
+From: AK Sharma <maskachoska@yahoo.com>
+Date: Mon, 21 Sep 2026 13:35:40 +0530
+Subject: [PATCH 1/4] mediatek: add JioRouter AX6000 JIDU6801 device and
+ handoff support files
+
+Adds Device/jiorouter_ax6000-jidu6801 (reuses the upstream jidu6101 DTS - the
+hardware is identical) plus two custom files used by the RAM-handoff install:
+
+ - etc/uci-defaults/99-jidu6801-lan keeps the stock LAN address as a second
+   address, since the image is booted from RAM/UBI rather than flashed.
+ - etc/init.d/handoff-ack bumps a token in the overlay on every boot, which the
+   stock-side boot hook reads to clear its failure streak.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ files/etc/init.d/handoff-ack           | 26 ++++++++++++++++++++++++++
+ files/etc/rc.d/S99handoff-ack          |  1 +
+ files/etc/uci-defaults/99-jidu6801-lan |  6 ++++++
+ target/linux/mediatek/image/filogic.mk | 15 +++++++++++++++
+ 4 files changed, 48 insertions(+)
+ create mode 100755 files/etc/init.d/handoff-ack
+ create mode 120000 files/etc/rc.d/S99handoff-ack
+ create mode 100755 files/etc/uci-defaults/99-jidu6801-lan
+
+diff --git a/files/etc/init.d/handoff-ack b/files/etc/init.d/handoff-ack
+new file mode 100755
+index 0000000..98137d7
+--- /dev/null
++++ b/files/etc/init.d/handoff-ack
+@@ -0,0 +1,26 @@
++#!/bin/sh /etc/rc.common
++# Prove to the stock-side boot hook that OUR kernel really booted.
++#
++# The hook (which runs on stock) cannot tell a failed handoff from a deliberate
++# reboot, so it used a clock-based 5-strike guard - and the stock clock jumps
++# around (no RTC, NTP sets it to whatever it likes), which made that guard fire
++# at random in both directions.
++#
++# Instead: every boot of this kernel writes a fresh token (boot id + count) to
++# this volume (rootfs_data = ubi0:2, which survives reboots).  The hook mounts
++# that volume read-only and clears its failure streak whenever the token
++# changed - so only attempts that did NOT reach this kernel count toward the
++# disarm threshold.
++START=99
++
++start() {
++	local ack=/overlay/handoff-ack
++	[ -d /overlay ] || return 0
++	local n
++	n=$(cat "$ack" 2>/dev/null | awk '{print $2}')
++	# The boot id makes the token different on every boot even if this volume is
++	# ever wiped and the counter restarts - the hook compares tokens for
++	# inequality, not for growth.
++	echo "$(cat /proc/sys/kernel/random/boot_id) $((n + 1))" > "$ack"
++	logger -t handoff-ack "boot ack $((n + 1))"
++}
+diff --git a/files/etc/rc.d/S99handoff-ack b/files/etc/rc.d/S99handoff-ack
+new file mode 120000
+index 0000000..03e32bf
+--- /dev/null
++++ b/files/etc/rc.d/S99handoff-ack
+@@ -0,0 +1 @@
++../init.d/handoff-ack
+\ No newline at end of file
+diff --git a/files/etc/uci-defaults/99-jidu6801-lan b/files/etc/uci-defaults/99-jidu6801-lan
+new file mode 100755
+index 0000000..fd087c5
+--- /dev/null
++++ b/files/etc/uci-defaults/99-jidu6801-lan
+@@ -0,0 +1,6 @@
++#!/bin/sh
++# JIDU6801 handoff image: also keep the address the stock firmware used, so the
++# existing wiring/bookmarks (192.168.31.1) keep working next to the image default.
++uci -q add_list network.lan.ipaddr='192.168.31.1/24'
++uci -q commit network
++exit 0
+diff --git a/target/linux/mediatek/image/filogic.mk b/target/linux/mediatek/image/filogic.mk
+index 0acaa7d..e358f13 100644
+--- a/target/linux/mediatek/image/filogic.mk
++++ b/target/linux/mediatek/image/filogic.mk
+@@ -2357,6 +2357,21 @@ define Device/jiorouter_ax6000-jidu6j01
+ endef
+ TARGET_DEVICES += jiorouter_ax6000-jidu6j01
+ 
++define Device/jiorouter_ax6000-jidu6801
++  DEVICE_VENDOR := JioRouter
++  DEVICE_MODEL := AX6000
++  DEVICE_VARIANT := JIDU6801
++  DEVICE_DTS := mt7986a-jiorouter-ax6000-jidu6101
++  DEVICE_DTS_DIR := ../dts
++  DEVICE_PACKAGES := kmod-usb3 kmod-mt7915e kmod-mt7916-firmware kmod-mt7986-firmware mt7986-wo-firmware
++  UBINIZE_OPTS := -E 5
++  UBOOTENV_IN_UBI := 1
++  BLOCKSIZE := 128k
++  PAGESIZE := 2048
++  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
++endef
++TARGET_DEVICES += jiorouter_ax6000-jidu6801
++
+ define Device/kebidumei_ax3000-u22
+   DEVICE_VENDOR := Kebidumei
+   DEVICE_MODEL := AX3000-U22
+-- 
+2.53.0
+
